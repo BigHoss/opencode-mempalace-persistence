@@ -1,7 +1,7 @@
 {
-  "name": "opencode-mempalace-persistence",
-  "version": "2.8.1",
-  "description": "OpenCode plugin — auto-sync conversations to MemPalace memory in real-time. No forced wings, KG extraction via MCP tools.",
+  "name": "@rapha/opencode-mempalace-persistence",
+  "version": "3.0.0",
+  "description": "OpenCode v2 plugin — auto-sync conversations to MemPalace memory in real-time. No forced wings, KG extraction via MCP tools.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -14,24 +14,25 @@
   },
   "keywords": [
     "opencode",
+    "opencode-v2",
     "mempalace",
     "memory",
     "opencode-plugin",
     "typescript"
   ],
-  "author": "geco",
+  "author": "geco (original); Raphael <rapha@kuster.live> (v2 port)",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/geco/opencode-mempalace-persistence.git"
+    "url": "git+https://github.com/BigHoss/opencode-mempalace-persistence.git"
   },
   "bugs": {
-    "url": "https://github.com/geco/opencode-mempalace-persistence/issues"
+    "url": "https://github.com/BigHoss/opencode-mempalace-persistence/issues"
   },
-  "homepage": "https://github.com/geco/opencode-mempalace-persistence#readme",
+  "homepage": "https://github.com/BigHoss/opencode-mempalace-persistence#readme",
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.15.0",
+    "@opencode/plugin": "^2.0.6",
     "@types/node": "^25.8.0",
     "typescript": "^6.0.3"
   }
