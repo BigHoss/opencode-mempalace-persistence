@@ -1,16 +1,15 @@
 # opencode-mempalace-persistence
 
-> **Community plugin** — not officially maintained by the MemPalace team. Fully open source, ~450 lines of TypeScript.
+> **Community plugin** — not officially maintained by the MemPalace team. Fully open source.
+>
+> **v3.0.0** is an OpenCode **v2-only** port (`@opencode/plugin` SDK). For OpenCode v1.x, install `opencode-mempalace-persistence@2.x` instead. See the [migration guide](https://opencode.ai/v2/docs/migrate-v1) for details.
 
 An OpenCode plugin that automatically saves every conversation to MemPalace and uses stored memory to provide better, context-aware responses. Real-time, zero cron, zero external scripts.
 
 Follows the official MemPalace automation pattern (same as the Claude Code hooks): the plugin decides **when** to save, the model decides **what** to file via the MemPalace MCP tools.
 
-[![npm version](https://img.shields.io/npm/v/opencode-mempalace-persistence.svg)](https://www.npmjs.com/package/opencode-mempalace-persistence)
-[![npm downloads](https://img.shields.io/npm/dm/opencode-mempalace-persistence.svg)](https://www.npmjs.com/package/opencode-mempalace-persistence)
+[![npm version](https://img.shields.io/npm/v/@rapha/opencode-mempalace-persistence.svg)](https://www.npmjs.com/package/@rapha/opencode-mempalace-persistence)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-
-![Demo: a decision filed on Monday is recalled verbatim by a different session on Thursday — memory outlives sessions, not just compaction](demo.gif)
 
 ---
 
@@ -20,23 +19,25 @@ Follows the official MemPalace automation pattern (same as the Claude Code hooks
 |---|---|
 | Every session starts from scratch | The model knows who you are and what you've done |
 | You repeat context each time | Memory is automatic |
-| Model starts from scratch each time | Memory persists across sessions |
+| Model starts from scratch each session | Memory persists across sessions |
 
-The plugin injects relevant memories from MemPalace into every prompt (via `experimental.chat.messages.transform`), and saves every response back to MemPalace. A perfect feedback loop.
+The plugin injects relevant memories from MemPalace into every prompt (via `ctx.session.hook("context", ...)`), and saves every response back to MemPalace. A perfect feedback loop.
 
 ---
 
-## Installation
+## Installation (OpenCode v2)
 
 ### 1. Plugin (saves conversations)
 
-```json
+Add this to your `~/.config/opencode/opencode.json`:
+
+```jsonc
 {
-  "plugin": ["opencode-mempalace-persistence"]
+  "plugins": ["@rapha/opencode-mempalace-persistence"]
 }
 ```
 
-Add this line to your `~/.config/opencode/opencode.json` and restart OpenCode.
+(Use the v2 `plugins` array — `plugin` is the v1 key and will be ignored.)
 
 ### 2. Identity (who you are)
 
@@ -238,37 +239,30 @@ The plugin exports everything in the opencode database on the next sync, then re
                  ┌──────────────────────────────┐
                  │         OpenCode              │
                  │                               │
-  User msg ─────►│  experimental.chat.messages   │
-                 │  .transform hook              │
+  User msg ─────►│  ctx.session.hook("context")  │
                  │    ↓                          │
                  │  Injects identity + memories  │
                  │  (autoInjectContext: true)    │
                  │    ↓                          │
                  │  Model sees context → answers │
                  │    ↓                          │
-  Answer done ──►│  chat.message (count) + session.idle   │
-                 │  mine on idle / exit / startup           │
-                 │    ↓                                     │
-                 │  Query OpenCode DB (completed turns)     │
-                 │    ↓                                     │
-                 │  Export → flat text files (0700)         │
-                 │    ↓                                     │
-                 │  mempalace mine --mode convos            │
-                 │  single serialized call                  │
-                 └──────────────────────────────────────────┘
+  Answer done ──►│  ctx.session.hook("prompt")   │
+                 │  + ctx.event.subscribe        │
+                 │    ↓                          │
+                 │  mine on idle / exit / startup│
+                 │    ↓                          │
+                 │  Query OpenCode DB (turns)    │
+                 │    ↓                          │
+                 │  Export → flat text files     │
+                 │    ↓                          │
+                 │  mempalace mine --mode convos  │
+                 └──────────────────────────────┘
                             │
                             ▼
                  ┌──────────────────────────┐
                  │      MemPalace            │
                  │  ~/opencode-memory/       │
                  │  Vector DB + KG           │
-                 └──────────────────────────┘
-                            ▲
-                            │
-                 ┌──────────────────────────┐
-                 │  Model (via AGENTS.md)    │
-                 │  Records KG facts:       │
-                 │  kg_add / kg_invalidate  │
                  └──────────────────────────┘
 ```
 
@@ -278,13 +272,14 @@ The plugin exports everything in the opencode database on the next sync, then re
 
 | File | Purpose |
 |---|---|
-| `~/.config/opencode/opencode.json` | OpenCode config with plugin + MCP |
+| `~/.config/opencode/opencode.json` | OpenCode config with plugin + MCP (`plugins` array, v2 schema) |
 | `~/.config/opencode/AGENTS.md` | Tells the model to manage KG facts |
 | `~/.mempalace/plugin-config.json` | Plugin config (`autoInjectContext`, `saveInterval`, `toasts` — all optional, see §4) |
 | `~/.config/opencode/skills/mempalace-recall/SKILL.md` | Bundled recall skill (copy from `skills/` in this repo) |
 | `~/.mempalace/identity.txt` | Your identity (injected by plugin) |
 | `~/.mempalace/hook_state/opencode_counters.json` | Per-session message counters (checkpoint cadence) |
-| `~/.mempalace/hook_state/hook.log` | Checkpoint / pre-compact event log (errors always land here) |
+| `~/.mempalace/hook_state/hook.log` | All hook activity + toasts (errors always land here) |
+| `~/.mempalace/hook_state/interactions.log` | Structured interaction log backing `/memory-log` |
 | `~/.mempalace/oc-sessions/` | Private (0700) export workspace for pending transcripts |
 | `~/.mempalace/config.json` | MemPalace config (palace path) |
 | `~/.mempalace/knowledge_graph.sqlite3` | Knowledge Graph (structured facts) |
@@ -295,17 +290,17 @@ The plugin exports everything in the opencode database on the next sync, then re
 
 ## Install from npm
 
-```json
+```jsonc
 {
-  "plugin": ["opencode-mempalace-persistence"]
+  "plugins": ["@rapha/opencode-mempalace-persistence"]
 }
 ```
 
 ## Local development
 
-```json
+```jsonc
 {
-  "plugin": ["/path/to/opencode-mempalace-persistence/dist/index.js"]
+  "plugins": ["/path/to/opencode-mempalace-persistence/dist/index.js"]
 }
 ```
 
@@ -319,25 +314,27 @@ When set, the plugin writes a debug log to `/tmp/opencode-mempalace.log`.
 
 ---
 
-## Observability: toasts and commands
+## Observability: hook log + slash commands
 
-Background memory activity is visible three ways — ephemeral first,
-history on demand, never polluting session context:
+OpenCode v2 separates server-side plugins (this one) from TUI plugins.
+Toasts belong to the TUI surface, which is a separate plugin entry type.
+Until a paired TUI plugin ships, all ephemeral messages route through
+`~/.mempalace/hook_state/hook.log` (always written, never silent).
 
-- **TUI toasts** (on by default, `"toasts": false` to disable): mine
-  results and errors, armed checkpoints, and every MemPalace call
-  (plugin searches and model MCP calls) with what was asked plus a
-  short answer preview. A startup toast shows the loaded build
-  (`opencode-mempalace-persistence v2.x loaded`), so npm-cache vs
-  local build is never a mystery.
-- **`/memory-status`** — palace health in the transcript: drawers,
-  KG stats, last sync, pending backlog, recent activity, errors with
-  explanations, active config. Read-only.
+On-demand visibility:
+
+- **`/memory-status`** — palace health in the transcript: sync state,
+  pending backlog, active config, recent log tail, activity counts.
+  Read-only.
 - **`/memory-log [N] [filter]`** — the interaction history: every
   search (query → result count), tool call (asked → answered preview),
   mine (outcome per wing) and checkpoint, newest last. Backed by
   `~/.mempalace/hook_state/interactions.log` (JSON lines, auto-rotated).
   Read-only.
+
+To restore the v1 ephemeral-toast UX, ship a paired TUI plugin entry
+in the same package that subscribes to `hook.log` via file watch and
+calls `ctx.ui.toast.show({title, message, variant})`. (Tracked for v3.1.)
 
 ---
 
