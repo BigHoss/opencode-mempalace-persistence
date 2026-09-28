@@ -4,7 +4,7 @@ import { homedir } from "os"
 import { join, dirname } from "path"
 import { createHash } from "crypto"
 import { fileURLToPath } from "url"
-import type { Plugin } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 
 const HOME = homedir()
 const MEMPALACE_BIN = join(HOME, ".local/bin/mempalace")
@@ -155,19 +155,18 @@ function countPendingSuffix(): string {
   return pending > 0 ? `, ${pending} file(s) waiting to mine` : ", queue empty"
 }
 
-// TUI toast client (set by the factory). Fire-and-forget: headless runs
-// (`opencode run`, no TUI attached) must never break on this.
+// TUI toast fallback (v2 server-side plugin has no UI domain — the
+// `ctx.ui` toast API lives on the separate TUI plugin entry type, see
+// https://opencode.ai/v2/docs/build/plugins/cli). Until we ship a paired
+// TUI plugin in the same package, route visibility through hook.log so
+// the user sees activity via /memory-status / /memory-log and tailing
+// the log file. Same fire-and-forget semantics.
 let tuiClient: any = null
-// Throttle for routine skip notices (busy palace): at most one toast
-// per window, otherwise active sessions get spammed every turn.
 let lastBusyToastTs = 0
 const BUSY_TOAST_WINDOW_MS = 5 * 60 * 1000
 function toast(variant: "info" | "success" | "warning" | "error", title: string, message: string): void {
-  if (!toastsEnabled() || !tuiClient?.tui?.showToast) return
-  try {
-    const p = tuiClient.tui.showToast({ body: { title, message, variant, duration: 5000 } })
-    if (p && typeof p.catch === "function") p.catch(() => {})
-  } catch {}
+  if (!toastsEnabled()) return
+  hookLog(`toast/${variant} ${title}: ${message}`)
 }
 
 // Probe for a working Python interpreter at startup instead of hardcoding
@@ -801,57 +800,158 @@ function exitSync(): void {
   } catch (e) { errLog("exit save err: " + String(e)) }
 }
 
-export default (async ({ client }: any) => {
-  tuiClient = client || null
-  mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
-  mkdirSync(HOOK_STATE_DIR, { recursive: true })
-  const autoInject = isAutoInjectEnabled()
-  const identity = readIdentity()
-  const interval = saveInterval()
-  log(`loaded (autoInjectContext: ${autoInject}, saveInterval: ${interval})`)
+// ============================================================================
+// v2 entrypoint: Plugin.define({ id, setup })
+// ============================================================================
 
-  // Catch anything missed by a previous run (e.g. content skipped when
-  // the exit budget ran out). Fires once per server lifetime.
-  setTimeout(() => dbSync(), 10000)
+// v2 sessionID: the docs don't put it on every event. For the prompt hook
+// it's the session the prompt is admitted into; metadata may carry it.
+// Fall back to "global" if absent — counters stay per-session but degrade
+// gracefully if opencode doesn't surface it.
+function sessionIdFromEvent(event: any): string {
+  return event?.metadata?.sessionID || event?.sessionID || "global"
+}
 
-  // Startup toast (delayed so the TUI is attached): shows exactly which
-  // plugin build is loaded — no more guessing npm-cache vs local build —
-  // plus pending backlog so a restarted-into-backlog state is visible.
-  setTimeout(() => {
-    toast("info", "MemPalace", `${pluginName()} v${pluginVersion()} loaded${countPendingSuffix()}`)
-    log(`startup toast fired (${pluginName()} v${pluginVersion()})`)
-  }, 15000)
+// Build a status report for `/memory-status`. Read-only — touches no state.
+function buildStatusReport(): string {
+  const lines: string[] = []
+  lines.push(`MemPalace status (plugin v${pluginVersion()})`)
+  lines.push("=".repeat(48))
 
-  // Crash safety: best-effort synchronous save on hard exit.
-  // Mirrors the official emergency-save intent (nothing async allowed here).
-  // SIGHUP included: closing the terminal / dropping SSH kills the process
-  // group, otherwise mines would die mid-run with no save attempt.
-  let exitHandled = false
-  const onExit = () => {
-    if (exitHandled) return
-    exitHandled = true
-    exitSync()
-  }
-  process.once("SIGINT", onExit)
-  process.once("SIGTERM", onExit)
-  process.once("SIGHUP", onExit)
-  process.once("exit", onExit)
+  try {
+    const st = readSyncState()
+    const last = st.last_sync_ms ? new Date(st.last_sync_ms).toISOString() : "never"
+    const wingKeys = Object.keys(st.wings || {})
+    const wingDetail = wingKeys.length > 0
+      ? wingKeys.map((w) => `${w}=${new Date((st.wings as any)[w]).toISOString()}`).join(", ")
+      : "none"
+    lines.push(`Sync: last=${last}`)
+    lines.push(`Wings: ${wingDetail}`)
+  } catch (e) { lines.push(`Sync: read err ${e}`) }
 
+  try {
+    const pending = countPendingMessages()
+    const wingEntries = Object.entries(pending.byWing)
+    const detail = wingEntries.length > 0
+      ? ` across ${wingEntries.length} wing(s): ${wingEntries.map(([w, n]) => `${w}=${n}`).join(", ")}`
+      : ""
+    lines.push(`Pending: ${pending.total} message(s)${detail}`)
+  } catch {}
+
+  try {
+    const raw = existsSync(PLUGIN_CONFIG) ? JSON.parse(readFileSync(PLUGIN_CONFIG, "utf-8")) : {}
+    lines.push("Config:")
+    lines.push(`  autoInjectContext: ${(raw as any)?.autoInjectContext ?? false}`)
+    lines.push(`  saveInterval: ${(raw as any)?.saveInterval ?? DEFAULT_SAVE_INTERVAL}`)
+    lines.push(`  toasts: ${(raw as any)?.toasts ?? true}`)
+  } catch {}
+
+  try {
+    if (existsSync(HOOK_LOG)) {
+      const raw = readFileSync(HOOK_LOG, "utf-8")
+      const tail = raw.split("\n").filter(Boolean).slice(-5)
+      if (tail.length > 0) {
+        lines.push("")
+        lines.push("Recent log (last 5):")
+        tail.forEach((l) => lines.push(`  ${l}`))
+      }
+    }
+  } catch {}
+
+  try {
+    if (existsSync(INTERACTIONS_LOG)) {
+      const raw = readFileSync(INTERACTIONS_LOG, "utf-8")
+      const recent = raw.split("\n").filter(Boolean).slice(-100)
+      const counts: Record<string, number> = {}
+      for (const line of recent) {
+        try {
+          const obj = JSON.parse(line)
+          if (typeof obj.kind === "string") counts[obj.kind] = (counts[obj.kind] || 0) + 1
+        } catch {}
+      }
+      if (Object.keys(counts).length > 0) {
+        lines.push("")
+        lines.push(`Activity (last ${recent.length} entries):`)
+        Object.entries(counts).forEach(([k, n]) => lines.push(`  ${k}: ${n}`))
+      }
+    }
+  } catch {}
+
+  return lines.join("\n")
+}
+
+// Parse `/memory-log N filter` arg tail (the command name is already stripped).
+function parseArgsFromText(text: string): { n: number; filter?: string } {
+  const stripped = text.replace(/^\s*\/memory-log\b\s*/i, "").trim()
+  const tokens = stripped.split(/\s+/)
+  const nStr = tokens.shift()
+  const n = parseInt(nStr ?? "20", 10)
   return {
-    "chat.message": async (input, output) => {
-      const role = (output.message as any).role
-      if (role !== "user") return
-      const text = hasText(output.parts || [])
-      if (!text) return
-      const sessionID = (input as any)?.sessionID || "global"
+    n: Number.isFinite(n) && n > 0 ? n : 20,
+    filter: tokens.length > 0 ? tokens.join(" ") : undefined,
+  }
+}
 
-      // Official Save-hook cadence: count human messages per session,
-      // persist like ~/.mempalace/hook_state/, arm ONE AI checkpoint
-      // per boundary. The model decides WHAT to file.
-      // NOTE: no mine here by design (see PR #1524 review) — mining a
-      // mid-reply snapshot would export partial assistant parts. Mines
-      // run on idle/exit/startup, when turns are complete; the export
-      // additionally skips unfinished replies (finish tracking).
+// Tail the interactions log for `/memory-log`.
+function readInteractionsLog({ n, filter }: { n: number; filter?: string }): string {
+  if (!existsSync(INTERACTIONS_LOG)) return "no interactions log yet"
+  try {
+    const raw = readFileSync(INTERACTIONS_LOG, "utf-8")
+    const all = raw.split("\n").filter(Boolean).map((line) => {
+      try { return JSON.parse(line) } catch { return null }
+    }).filter((x): x is Record<string, unknown> => x !== null)
+    let filtered = all
+    if (filter) {
+      const f = filter.toLowerCase()
+      filtered = all.filter((e) => JSON.stringify(e).toLowerCase().includes(f))
+    }
+    const tail = filtered.slice(-n)
+    if (tail.length === 0) return "no matching entries"
+    const head = `Memory log (${tail.length} ${filter ? "matching" : "most recent"} entries, newest last):`
+    const out: string[] = [head]
+    for (const e of tail) {
+      const ts = (e.ts as string) || "?"
+      const kind = (e.kind as string) || "?"
+      const { ts: _, kind: __, ...rest } = e
+      const detail = Object.keys(rest).length > 0 ? ` ${JSON.stringify(rest)}` : ""
+      out.push(`  [${ts}] ${kind}${detail}`)
+    }
+    return out.join("\n")
+  } catch (e) { return `log read err: ${e}` }
+}
+
+export default Plugin.define({
+  id: "opencode-mempalace-persistence",
+  async setup(ctx) {
+    // v2 ctx is typed: domains like ctx.session, ctx.tool, ctx.command,
+    // ctx.event. No raw client. Toast visibility falls back to hook.log
+    // (see toast() above) until a paired TUI plugin entry ships.
+
+    mkdirSync(OUT_DIR, { recursive: true, mode: 0o700 })
+    mkdirSync(HOOK_STATE_DIR, { recursive: true })
+
+    const autoInject = isAutoInjectEnabled()
+    const identity = readIdentity()
+    const interval = saveInterval()
+    log(`loaded (autoInjectContext: ${autoInject}, saveInterval: ${interval})`)
+    hookLog(`plugin loaded: v${pluginVersion()}`)
+
+    // Background catch-up + startup toast. Timers live for plugin lifetime.
+    setTimeout(() => dbSync(), 10_000)
+    setTimeout(() => {
+      toast("info", "MemPalace", `${pluginName()} v${pluginVersion()} loaded${countPendingSuffix()}`)
+      log(`startup toast fired (${pluginName()} v${pluginVersion()})`)
+    }, 15_000)
+
+    // ── session hooks ─────────────────────────────────────────────────────
+
+    // Replaces v1 "chat.message": count human messages, arm checkpoint
+    // at the saveInterval boundary.
+    await ctx.session.hook("prompt", (event: any) => {
+      const text = event.prompt?.text
+      if (!text) return
+      const sessionID = sessionIdFromEvent(event)
+
       const counters = loadCounters()
       const c = counters[sessionID] || { humanMsgs: 0, lastCheckpoint: 0 }
       c.humanMsgs += 1
@@ -865,16 +965,18 @@ export default (async ({ client }: any) => {
       }
       counters[sessionID] = c
       persistCounters(counters)
-    },
+    })
 
-    "experimental.chat.messages.transform": async (_input, output) => {
-      if (!output?.messages?.length) return
+    // Replaces v1 "experimental.chat.messages.transform": inject identity,
+    // recall, and checkpoint blocks before the model sees the prompt.
+    await ctx.session.hook("context", (event: any) => {
+      if (!event.messages?.length) return
 
       const injectParts: any[] = []
-      const lastUser = [...output.messages].reverse().find((m: any) => m.info?.role === "user")
+      const lastUser = [...event.messages].reverse().find((m: any) => m.info?.role === "user")
 
-      // AI checkpoint (works with or without autoInject: filing happens
-      // through the MemPalace MCP tools, the hook only decides WHEN).
+      // Checkpoint injection (works with or without autoInject: filing is
+      // done by the model via MCP tools; the hook only decides WHEN).
       if (pendingCheckpoint && lastUser) {
         injectParts.push({
           id: `mp-checkpoint-${Date.now()}`,
@@ -924,39 +1026,43 @@ export default (async ({ client }: any) => {
         lastUser.parts.push(...injectParts)
         log(`injected ${injectParts.length} context blocks`)
       }
-    },
+    })
 
-    // Official PreCompact pattern: compaction ALWAYS warrants a save.
-    // Instruct the model to file everything via MCP now, and re-attach
-    // identity + wake-up context so the summary cannot lose them (rescue).
-    "experimental.session.compacting": async (input, output) => {
-      const sessionID = (input as any)?.sessionID || "unknown"
+    // Replaces v1 "experimental.session.compacting": pre-compact emergency
+    // save + rescue context (identity + wake-up re-attached so the summary
+    // cannot lose them).
+    await ctx.session.hook("compaction", (event: any) => {
+      const sessionID = sessionIdFromEvent(event)
       log(`compacting session ${sessionID} - emergency save + rescue`)
       hookLog(`pre-compact emergency save for session ${sessionID}`)
-      output.context.push(precompactInstruction())
+      event.context.push(precompactInstruction())
       const rescue: string[] = []
       if (identity) rescue.push(`[MemPalace Identity]\n${identity}`)
       const wakeup = mempalaceWakeup()
       if (wakeup) rescue.push(`[MemPalace Wake-up]\n${wakeup}`)
       if (rescue.length > 0) {
-        output.context.push(`[MemPalace Rescue — core memory, must survive compaction]\n${rescue.join("\n\n")}`)
+        event.context.push(`[MemPalace Rescue — core memory, must survive compaction]\n${rescue.join("\n\n")}`)
       }
-    },
+    })
 
-    "tool.execute.after": async (input, output) => {
+    // ── tool hook ─────────────────────────────────────────────────────────
+
+    // Replaces v1 "tool.execute.after": toast when the model drives a
+    // MemPalace MCP tool (recall / diary / KG). Same shape as v1 — log
+    // the tool name, args preview, result preview.
+    await ctx.tool.hook("execute.after", (event: any) => {
       try {
-        const name = (input as any)?.tool || ""
+        const name = event.tool || ""
         if (!isMemPalaceTool(name)) return
-        const summary = summarizeToolCall(name, (input as any)?.args, output)
+        const args = event.input?.args ?? event.input
+        const summary = summarizeToolCall(name, args, event.output)
         log(`tool: ${summary}`)
         toast("info", "MemPalace", summary)
-        // Diagnostic: MCP results may live outside `output` — record the
-        // real shape once so extraction can be fixed (see answered-empty).
-        const outAny = (output as any) || {}
+        const outAny = event.output || {}
         ilog("tool", {
           tool: String(name).replace(/^mcp_+/, "").replace(/^mempalace_mempalace_/, "").replace(/^mempalace_/, ""),
-          asked: (() => { try { return JSON.stringify((input as any)?.args || {}).replace(/\s+/g, " ").slice(0, 200) } catch { return "" } })(),
-          answered: extractResultText(output).replace(/\s+/g, " ").slice(0, 300),
+          asked: (() => { try { return JSON.stringify(args || {}).replace(/\s+/g, " ").slice(0, 200) } catch { return "" } })(),
+          answered: extractResultText(event.output).replace(/\s+/g, " ").slice(0, 300),
           shape: {
             keys: Object.keys(outAny),
             title: outAny.title,
@@ -965,13 +1071,76 @@ export default (async ({ client }: any) => {
           },
         })
       } catch {}
-    },
+    })
 
-    event: async ({ event }: any) => {
-      if (event?.type === "session.idle" || event?.type === "session.deleted") {
-        log(`${event.type} - queue sync`)
-        setTimeout(() => dbSync(), 3000)
+    // ── event subscription (replaces v1 event hook) ─────────────────────
+
+    // v1's `event: async ({ event }) => {}` becomes an async iterable
+    // bound to an AbortController. Cleanup function from setup() aborts it.
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          const t = (event as any)?.type
+          if (t === "session.idle" || t === "session.deleted") {
+            log(`${t} - queue sync`)
+            setTimeout(() => dbSync(), 3000)
+          }
+        }
+      } catch (e) {
+        log(`event subscription ended: ${e}`)
       }
-    },
-  }
-}) satisfies Plugin
+    })()
+
+    // ── slash commands (NEW in v2; replaces external Markdown files) ─────
+
+    await ctx.command.transform((editor) => {
+      editor.add({
+        name: "memory-status",
+        description: "Show MemPalace health: sync state, pending backlog, active config, recent activity",
+        execute: async ({ sessionID, prompt, delivery }: any) => {
+          const text = buildStatusReport()
+          await ctx.session.prompt({
+            ...prompt,
+            sessionID,
+            text: `[memory-status]\n${text}\n[/memory-status]`,
+            delivery,
+          })
+        },
+      })
+      editor.add({
+        name: "memory-log",
+        description: "Show interaction history (searches, tool calls, mines, checkpoints). Args: [N] [filter]",
+        execute: async ({ sessionID, prompt, delivery }: any) => {
+          const args = parseArgsFromText(prompt.text || "")
+          const text = readInteractionsLog(args)
+          await ctx.session.prompt({
+            ...prompt,
+            sessionID,
+            text: `[memory-log]\n${text}\n[/memory-log]`,
+            delivery,
+          })
+        },
+      })
+    })
+
+    // ── signal handlers (best-effort exit sync across opencode restarts) ─
+
+    let exitHandled = false
+    const onExit = () => {
+      if (exitHandled) return
+      exitHandled = true
+      exitSync()
+    }
+    process.once("SIGINT", onExit)
+    process.once("SIGTERM", onExit)
+    process.once("SIGHUP", onExit)
+    process.once("exit", onExit)
+
+    // Cleanup returned from setup() runs when the plugin unloads.
+    return () => {
+      controller.abort()
+    }
+  },
+})
+
