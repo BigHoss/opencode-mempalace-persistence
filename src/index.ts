@@ -173,30 +173,52 @@ function toast(variant: "info" | "success" | "warning" | "error", title: string,
 // one installer layout (pipx vs uv tool vs system). runPython only needs
 // stdlib (sqlite3/json), so any python3 works. Priority: explicit env
 // override, legacy pipx venv, uv tool venv, PATH fallback.
+// `undefined` = not yet resolved (sentinel); `string` = resolved path;
+// `null` = no interpreter found. After the first call, only string|null.
 let resolvedPython: string | null | undefined = undefined
 function resolvePython(): string | null {
   if (resolvedPython !== undefined) return resolvedPython
+  // Windows uv-tools installs at %APPDATA%\uv\tools\<pkg>\Scripts\python.exe
+  // (Unix) at ~/.local/share/uv/tools/<pkg>/bin/python3 — both checked.
+  const APPDATA = process.env.APPDATA || ""
+  const LOCALAPPDATA = process.env.LOCALAPPDATA || ""
   const candidates = [
     process.env.MEMPALACE_PYTHON,
+    // Unix paths (existing)
     join(HOME, ".local/share/pipx/venvs/mempalace/bin/python3"),
     join(HOME, ".local/share/uv/tools/mempalace/bin/python3"),
+    // Windows uv paths (new — issue: plugin couldn't find Python since Sep 23)
+    join(APPDATA, "uv", "tools", "mempalace", "Scripts", "python.exe"),
+    join(APPDATA, "uv", "tools", "mempalace", "bin", "python.exe"),
+    join(LOCALAPPDATA, "uv", "tools", "mempalace", "Scripts", "python.exe"),
+    join(LOCALAPPDATA, "uv", "tools", "mempalace", "bin", "python.exe"),
+    // Windows Python launcher fallbacks (new)
+    join(LOCALAPPDATA, "Programs", "Python", "Python313", "python.exe"),
+    join(LOCALAPPDATA, "Programs", "Python", "Python312", "python.exe"),
+    join(LOCALAPPDATA, "Programs", "Python", "Python311", "python.exe"),
+    join(LOCALAPPDATA, "Programs", "Python", "Python310", "python.exe"),
   ].filter((p): p is string => !!p && existsSync(p))
   if (candidates.length > 0) {
     resolvedPython = candidates[0]
   } else {
-    try {
-      execSync("python3 --version", { encoding: "utf-8", timeout: 10000 })
-      resolvedPython = "python3"
-    } catch {
-      resolvedPython = null
+    // PATH fallbacks — try `python` (Windows launcher), then `python3` (Unix)
+    let resolved = false
+    for (const cmd of ["python", "python3"] as const) {
+      try {
+        execSync(`${cmd} --version`, { encoding: "utf-8", timeout: 10000 })
+        resolvedPython = cmd
+        resolved = true
+        break
+      } catch {}
     }
+    if (!resolved) resolvedPython = null
   }
   if (resolvedPython) {
     log("using python: " + resolvedPython)
   } else {
-    errLog("no working Python interpreter found (tried MEMPALACE_PYTHON, pipx venv, uv tool venv, PATH python3) — DB export disabled")
+    errLog("no working Python interpreter found (tried MEMPALACE_PYTHON, pipx venv, uv tool venv, Windows uv tools, Windows Python launcher, PATH python/python3) — DB export disabled")
   }
-  return resolvedPython
+  return resolvedPython ?? null
 }
 
 let miningLock = false
