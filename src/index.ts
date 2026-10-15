@@ -119,22 +119,31 @@ print(json.dumps(by))
 }
 let cachedName: string | undefined = undefined
 let cachedVersion: string | undefined = undefined
+// Read package.json from one of several candidate locations so the plugin
+// works whether deployed as dist/index.js (project layout) or as a flat
+// plugins/mempalace.js (auto-discovery layout).
+function readPkg(): any | null {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const candidates = [
+    join(here, "package.json"),         // flat layout (plugins/mempalace.js + package.json)
+    join(here, "..", "package.json"),    // dist layout (plugins/dist/index.js)
+    join(here, "..", "..", "package.json"), // nested layout
+  ]
+  for (const p of candidates) {
+    try { return JSON.parse(readFileSync(p, "utf-8")) as any } catch {}
+  }
+  return null
+}
 function pluginName(): string {
   if (cachedName !== undefined) return cachedName
-  try {
-    const here = dirname(fileURLToPath(import.meta.url))
-    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf-8")) as any
-    cachedName = typeof pkg?.name === "string" ? pkg.name : "opencode-mempalace-persistence"
-  } catch { cachedName = "opencode-mempalace-persistence" }
+  const pkg = readPkg()
+  cachedName = typeof pkg?.name === "string" ? pkg.name : "opencode-mempalace-persistence"
   return cachedName ?? "opencode-mempalace-persistence"
 }
 function pluginVersion(): string {
   if (cachedVersion !== undefined) return cachedVersion
-  try {
-    const here = dirname(fileURLToPath(import.meta.url))
-    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf-8")) as any
-    cachedVersion = typeof pkg?.version === "string" ? pkg.version : "unknown"
-  } catch { cachedVersion = "unknown" }
+  const pkg = readPkg()
+  cachedVersion = typeof pkg?.version === "string" ? pkg.version : "unknown"
   return cachedVersion ?? "unknown"
 }
 
